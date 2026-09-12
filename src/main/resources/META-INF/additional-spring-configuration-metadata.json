@@ -1,0 +1,10 @@
+{
+  "properties": [
+    {
+      "name": "outpost.idempotency.ttl",
+      "type": "java.time.Duration",
+      "description": "How long a stored idempotent response is replayable before it is purged.",
+      "defaultValue": "24h"
+    }
+  ]
+}
