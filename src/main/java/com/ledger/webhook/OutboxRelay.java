@@ -45,7 +45,7 @@ class OutboxRelay {
 		if (reclaimed > 0) {
 			log.warn("Returned {} stale PROCESSING outbox rows to PENDING", reclaimed);
 		}
-		outbox.findDueIds(now.minus(properties.pollGrace()), Limit.of(properties.pollBatchSize())).forEach(this::publish);
+		outbox.findDueIds(now, Limit.of(properties.pollBatchSize())).forEach(this::publish);
 	}
 
 	private void publish(UUID outboxId) {

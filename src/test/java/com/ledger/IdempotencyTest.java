@@ -10,6 +10,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -91,6 +93,25 @@ class IdempotencyTest extends IntegrationTestBase {
 		assertThat(statuses).allSatisfy(s -> assertThat(s).isIn(HttpStatus.CREATED, HttpStatus.CONFLICT));
 		assertThat(statuses).contains(HttpStatus.CREATED);
 		assertThat(dbBalance(account.accountNumber())).isEqualByComparingTo(money("7.0000"));
+	}
+
+	@Test
+	void abandonedInFlightKeyCanBeTakenOver() {
+		AccountView account = openAccount("USD");
+		String key = UUID.randomUUID().toString();
+		jdbc.sql("""
+				insert into idempotency_keys (key, request_hash, status_code, created_at)
+				values (?, ?, 0, ?)
+				""").params(USER + ":" + key, "0".repeat(64), Instant.now().minusSeconds(31).atOffset(ZoneOffset.UTC))
+				.update();
+
+		ResponseEntity<TransactionView> retry = deposit(account.accountNumber(), money("3.0000"), key);
+		ResponseEntity<TransactionView> replay = deposit(account.accountNumber(), money("3.0000"), key);
+
+		assertThat(retry.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+		assertThat(retry.getHeaders().getFirst("Idempotent-Replayed")).isNull();
+		assertThat(replay.getHeaders().getFirst("Idempotent-Replayed")).isEqualTo("true");
+		assertThat(dbBalance(account.accountNumber())).isEqualByComparingTo(money("3.0000"));
 	}
 
 	@Test

@@ -23,13 +23,12 @@ This document is the system design. It is written so a new engineer can run the 
 
 ## Stack
 
-| Piece | Version | Role |
-| --- | --- | --- |
-| Java | 26 | Runtime. Virtual threads are on. |
-| Spring Boot | 4.1.1 | HTTP, JPA, Kafka, Redis, Flyway |
-| PostgreSQL | 18 | Ledger, outbox, idempotency store |
-| Redis | 8 | In-flight idempotency lock |
-| Kafka | 4.3.1 (KRaft) | Dispatch topic and dead-letter topic |
+| Piece       | Version       | Role                                 |
+| ----------- | ------------- | ------------------------------------ |
+| Java        | 26            | Runtime. Virtual threads are on.     |
+| Spring Boot | 4.1.2         | HTTP, JPA, Kafka, Flyway             |
+| PostgreSQL  | 18            | Ledger, outbox, idempotency store    |
+| Kafka       | 4.3.1 (KRaft) | Dispatch topic and dead-letter topic |
 
 Schema lives in `src/main/resources/db/migration/V1__init_schema.sql`. Flyway applies it on startup. Hibernate only validates; it does not create tables.
 
@@ -78,7 +77,7 @@ POST requests may send `Idempotency-Key`. The filter only runs when the caller i
 | First success (2xx) | Response stored in `idempotency_keys`. |
 | Same key, same body | Stored response replayed. Header `Idempotent-Replayed: true`. |
 | Same key, different body | `422`. |
-| Same key, still in flight | `409`. Redis `SET NX` lock, 30s TTL. |
+| Same key, still in flight | `409`. Abandoned after 30s, then the key can be taken over. |
 | First attempt failed (4xx / 5xx) | Nothing stored. The key can be reused. |
 
 Keys are scoped as `<username>:<header>`. A SHA-256 of method + URI + body is what “same request” means. Stored keys older than `outpost.idempotency.ttl` (default 24h) are purged hourly.
@@ -166,11 +165,11 @@ Common status codes: `400` invalid body, `401` missing or bad credentials, `404`
 
 ### Webhook subscriptions
 
-| Method | Path | Body | Success |
-| --- | --- | --- | --- |
-| `POST` | `/api/v1/webhooks` | `{ "targetUrl": "https://…" }` | `201` subscription **with `secret`** |
-| `GET` | `/api/v1/webhooks` | | `200` this client's subscriptions (no secrets) |
-| `DELETE` | `/api/v1/webhooks/{id}` | | `204` deactivate |
+| Method   | Path                    | Body                           | Success                                        |
+| -------- | ----------------------- | ------------------------------ | ---------------------------------------------- |
+| `POST`   | `/api/v1/webhooks`      | `{ "targetUrl": "https://…" }` | `201` subscription **with** `secret`           |
+| `GET`    | `/api/v1/webhooks`      |                                | `200` this client's subscriptions (no secrets) |
+| `DELETE` | `/api/v1/webhooks/{id}` |                                | `204` deactivate                               |
 
 `targetUrl` must start with `http://` or `https://`. Delete is a soft deactivate: later postings skip that URL.
 
@@ -193,23 +192,17 @@ Needs JDK 26, Maven (or `./mvnw`), Docker.
 
 ```bash
 docker compose up -d
-# if 6379 or 5432 is already taken:
-# REDIS_PORT=6380 POSTGRES_PORT=5433 docker compose up -d
+# if 5432 is already taken:
+# POSTGRES_PORT=5433 docker compose up -d
 
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
 ```
 
 The `local` profile sets the API password to `local-dev-secret`. User is `outpost`. Without that profile you must set `OUTPOST_API_PASSWORD`; there is no default.
 
-If Redis is on a non-default host port, pass it through:
-
-```bash
-REDIS_PORT=6380 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
-```
-
 Health: `GET /actuator/health` (no auth).
 
-Tests start their own Postgres, Redis, and Kafka via Testcontainers. Docker must be running.
+Tests start their own Postgres and Kafka via Testcontainers. Docker must be running.
 
 ```bash
 ./mvnw test
@@ -225,14 +218,12 @@ Defaults are in `src/main/resources/application.properties`.
 | --- | --- | --- |
 | `DATABASE_URL` | `jdbc:postgresql://localhost:5432/outpost` | |
 | `DATABASE_USER` / `DATABASE_PASSWORD` | `outpost` / `outpost` | |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | |
 | `OUTPOST_API_USER` | `outpost` | |
 | `OUTPOST_API_PASSWORD` | *(required)* | Set by `local` profile in development |
 | `outpost.webhook.backoff` | `10s,30s,2m,10m,1h` | Delay before retry N is `backoff[N-1]` |
 | `outpost.webhook.jitter` | `0.2` | ±20% |
 | `outpost.webhook.poll-interval` | `PT5S` | ISO-8601, read by `@Scheduled` |
-| `outpost.webhook.poll-grace` | `15s` | Brand-new rows are left to the after-commit path |
 | `outpost.idempotency.ttl` | `24h` | |
 
 Virtual threads: `spring.threads.virtual.enabled=true`. That covers Tomcat, scheduled jobs, and Kafka listeners.

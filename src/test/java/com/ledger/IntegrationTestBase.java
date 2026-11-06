@@ -28,7 +28,6 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 		"outpost.webhook.backoff=200ms,200ms,200ms",
 		"outpost.webhook.jitter=0",
 		"outpost.webhook.poll-interval=PT0.2S",
-		"outpost.webhook.poll-grace=0s",
 		"outpost.webhook.stale-processing-after=30s" })
 abstract class IntegrationTestBase {
 

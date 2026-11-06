@@ -18,7 +18,6 @@ public record WebhookProperties(
 		@NotEmpty List<Duration> backoff,
 		@DecimalMin("0.0") @DecimalMax("1.0") double jitter,
 		@NotNull Duration pollInterval,
-		@NotNull Duration pollGrace,
 		@Positive int pollBatchSize,
 		@NotNull Duration staleProcessingAfter,
 		@NotBlank String dispatchTopic,
