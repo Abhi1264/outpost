@@ -4,25 +4,35 @@ import com.ledger.idempotency.IdempotencyFilter;
 import com.ledger.ledger.LedgerApi.AccountView;
 import com.ledger.ledger.LedgerApi.TransactionView;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.UnexpectedRollbackException;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
-import java.time.Instant;
-import java.time.ZoneOffset;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 class IdempotencyTest extends IntegrationTestBase {
+
+	@Autowired
+	PlatformTransactionManager transactions;
 
 	@Test
 	void sameKeyReplaysTheOriginalResponseWithoutRepostingTheLedger() {
@@ -87,7 +97,7 @@ class IdempotencyTest extends IntegrationTestBase {
 			statuses = IntStream.range(0, 20)
 					.mapToObj(i -> CompletableFuture.supplyAsync(
 							() -> deposit(account.accountNumber(), money("7.0000"), key).getStatusCode(), pool))
-					.toList().stream().map(CompletableFuture::join).toList();
+					.toList().stream().map(future -> future.join()).toList();
 		}
 
 		assertThat(statuses).allSatisfy(s -> assertThat(s).isIn(HttpStatus.CREATED, HttpStatus.CONFLICT));
@@ -96,29 +106,72 @@ class IdempotencyTest extends IntegrationTestBase {
 	}
 
 	@Test
-	void abandonedInFlightKeyCanBeTakenOver() {
+	void secondRequestCannotPostWhileTheFirstTransactionHoldsTheKey() throws Exception {
 		AccountView account = openAccount("USD");
 		String key = UUID.randomUUID().toString();
-		jdbc.sql("""
-				insert into idempotency_keys (key, request_hash, status_code, created_at)
-				values (?, ?, 0, ?)
-				""").params(USER + ":" + key, "0".repeat(64), Instant.now().minusSeconds(31).atOffset(ZoneOffset.UTC))
-				.update();
+		CountDownLatch locked = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		AtomicReference<Throwable> holderError = new AtomicReference<>();
 
-		ResponseEntity<TransactionView> retry = deposit(account.accountNumber(), money("3.0000"), key);
-		ResponseEntity<TransactionView> replay = deposit(account.accountNumber(), money("3.0000"), key);
+		Thread holder = Thread.ofVirtual().start(() -> {
+			try {
+				new TransactionTemplate(transactions).executeWithoutResult(status -> {
+					jdbc.sql("insert into idempotency_keys (key, request_hash, status_code) values (?, ?, 0)")
+							.params(USER + ":" + key, "a".repeat(64)).update();
+					locked.countDown();
+					try {
+						if (!release.await(20, TimeUnit.SECONDS)) {
+							throw new IllegalStateException("timed out holding the idempotency key");
+						}
+					}
+					catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+						throw new IllegalStateException(ex);
+					}
+					status.setRollbackOnly();
+				});
+			}
+			catch (UnexpectedRollbackException ignored) {
+				// in-flight row rolled back; the waiter can insert
+			}
+			catch (RuntimeException ex) {
+				holderError.set(ex);
+				locked.countDown();
+			}
+		});
 
-		assertThat(retry.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-		assertThat(retry.getHeaders().getFirst("Idempotent-Replayed")).isNull();
-		assertThat(replay.getHeaders().getFirst("Idempotent-Replayed")).isEqualTo("true");
-		assertThat(dbBalance(account.accountNumber())).isEqualByComparingTo(money("3.0000"));
+		CompletableFuture<ResponseEntity<TransactionView>> posted = null;
+		try {
+			assertThat(locked.await(10, TimeUnit.SECONDS)).isTrue();
+			assertThat(holderError.get()).isNull();
+
+			posted = CompletableFuture.supplyAsync(() -> deposit(account.accountNumber(), money("4.0000"), key));
+			await().atMost(Duration.ofSeconds(10)).until(() -> jdbc.sql("""
+					select count(*) from pg_stat_activity
+					where pid <> pg_backend_pid() and wait_event_type = 'Lock' and query ilike '%idempotency_keys%'
+					""").query(Long.class).single() > 0);
+
+			assertThat(posted.isDone()).isFalse();
+			assertThat(dbBalance(account.accountNumber())).isEqualByComparingTo(BigDecimal.ZERO);
+
+			release.countDown();
+			ResponseEntity<TransactionView> response = posted.get(15, TimeUnit.SECONDS);
+			assertThat(holderError.get()).isNull();
+			assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+			assertThat(response.getHeaders().getFirst("Idempotent-Replayed")).isNull();
+			assertThat(dbBalance(account.accountNumber())).isEqualByComparingTo(money("4.0000"));
+		}
+		finally {
+			release.countDown();
+			holder.join();
+		}
 	}
 
 	@Test
 	void keysAreScopedPerPrincipalAndRequireAuthentication() {
 		AccountView account = openAccount("USD");
 		ResponseEntity<String> anonymous = restClientBuilder.clone().baseUrl("http://localhost:" + port)
-				.defaultStatusHandler(HttpStatusCode::isError, (request, response) -> {
+				.defaultStatusHandler(status -> status.isError(), (request, response) -> {
 				})
 				.build()
 				.post().uri("/api/v1/accounts/{n}/deposits", account.accountNumber())

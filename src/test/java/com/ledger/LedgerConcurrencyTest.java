@@ -23,7 +23,7 @@ class LedgerConcurrencyTest extends IntegrationTestBase {
 			List<CompletableFuture<T>> futures = IntStream.range(0, n)
 					.mapToObj(i -> CompletableFuture.supplyAsync(() -> call.apply(i), pool))
 					.toList();
-			return futures.stream().map(CompletableFuture::join).toList();
+			return futures.stream().map(future -> future.join()).toList();
 		}
 	}
 
@@ -31,7 +31,7 @@ class LedgerConcurrencyTest extends IntegrationTestBase {
 	void concurrentDepositsAndWithdrawalsKeepBalanceAndJournalConsistent() {
 		AccountView account = openAccount("USD");
 		List<BigDecimal> deposits = IntStream.range(0, 100).mapToObj(i -> randomAmount()).toList();
-		BigDecimal expected = deposits.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+		BigDecimal expected = deposits.stream().reduce(BigDecimal.ZERO, (sum, amount) -> sum.add(amount));
 
 		List<ResponseEntity<TransactionView>> responses = runConcurrently(deposits.size(),
 				i -> deposit(account.accountNumber(), deposits.get(i)));

@@ -77,8 +77,10 @@ POST requests may send `Idempotency-Key`. The filter only runs when the caller i
 | First success (2xx) | Response stored in `idempotency_keys`. |
 | Same key, same body | Stored response replayed. Header `Idempotent-Replayed: true`. |
 | Same key, different body | `422`. |
-| Same key, still in flight | `409`. Abandoned after 30s, then the key can be taken over. |
+| Same key, transaction still open | Blocks on the primary key until that transaction commits, then replays or returns `422`. |
 | First attempt failed (4xx / 5xx) | Nothing stored. The key can be reused. |
+
+The stored row commits in the same database transaction as the journal. A crash cannot leave a posting without its replay record.
 
 Keys are scoped as `<username>:<header>`. A SHA-256 of method + URI + body is what “same request” means. Stored keys older than `outpost.idempotency.ttl` (default 24h) are purged hourly.
 
@@ -90,13 +92,13 @@ This is a transactional outbox, not “publish Kafka inside the ledger transacti
 2. After commit, `OutboxRelay` publishes each outbox id to `outpost.webhook.dispatch`.
 3. A poller republishes due rows every 5 seconds. That covers Kafka publish failures, retries, and workers that died mid-delivery.
 4. `WebhookDispatcher` atomically claims the row (`PENDING` → `PROCESSING`) and POSTs the payload. Duplicate Kafka messages are ignored if the claim returns 0.
-5. Success → `DELIVERED`. Transient failure → `PENDING` with `next_retry_at`. Permanent failure or exhausted retries → `FAILED` plus a record on `outpost.webhook.dlq`.
+5. 2xx → `DELIVERED`. A 3xx is a permanent failure. Transient failure → `PENDING` with `next_retry_at`. Permanent failure or exhausted retries → `FAILED`. That row is committed before a copy is sent to `outpost.webhook.dlq`.
 
 Rows stuck in `PROCESSING` longer than 5 minutes are treated as a crashed worker and returned to `PENDING`.
 
 **Retry schedule.** Default: 10s, 30s, 2m, 10m, 1h, each ±20% jitter. That is one first attempt plus five retries.
 
-**What is retried.** 5xx, timeouts, connection errors, 408, and 429. Other 4xx and an invalid target URL fail immediately.
+**What is retried.** 5xx, timeouts, connection errors, 408, and 429. 3xx, other 4xx, and an invalid or blocked target URL fail immediately.
 
 **Signature.** Every delivery sends:
 
@@ -130,7 +132,7 @@ The secret is shown once, when the subscription is created. Recipients should re
 }
 ```
 
-The dead-letter record includes `outboxId`, `eventType`, `targetUrl`, `attempts`, `lastError`, and `payload`. It does not include the secret.
+The dead-letter record includes `outboxId`, `eventType`, `targetUrl`, `attempts`, `lastError`, and `payload`. It does not include the secret. The `FAILED` outbox row is that record; it remains if the Kafka publish is rejected.
 
 ## API
 
@@ -161,7 +163,7 @@ Account response:
 }
 ```
 
-Common status codes: `400` invalid body, `401` missing or bad credentials, `404` unknown customer account, `409` idempotency conflict or constraint clash, `422` insufficient funds, currency mismatch, or reused idempotency key with a different body.
+Common status codes: `400` invalid body, `401` missing or bad credentials, `404` unknown customer account, `409` constraint clash, `422` insufficient funds, currency mismatch, or reused idempotency key with a different body.
 
 ### Webhook subscriptions
 
@@ -191,11 +193,15 @@ curl -s $AUTH -H 'Content-Type: application/json' \
 Needs JDK 26, Maven (or `./mvnw`), Docker.
 
 ```bash
-docker compose up -d
+# Postgres and Kafka only, app on the host
+docker compose up -d postgres kafka
 # if 5432 is already taken:
-# POSTGRES_PORT=5433 docker compose up -d
+# POSTGRES_PORT=5433 docker compose up -d postgres kafka
 
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+
+# App, Postgres, and Kafka together (API password local-dev-secret)
+docker compose up -d --build
 ```
 
 The `local` profile sets the API password to `local-dev-secret`. User is `outpost`. Without that profile you must set `OUTPOST_API_PASSWORD`; there is no default.

@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.ConsumerFactory;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -130,7 +131,7 @@ class WebhookDispatchTest extends IntegrationTestBase {
 		List<LoggedRequest> requests = WIREMOCK.findAll(postRequestedFor(urlEqualTo(sub.path())));
 		assertThat(requests).hasSize(3);
 		assertThat(requests).extracting(r -> r.getHeader("X-Webhook-Attempt")).containsExactly("1", "2", "3");
-		assertThat(requests).extracting(LoggedRequest::getBodyAsString).containsOnly(requests.getFirst().getBodyAsString());
+		assertThat(requests).extracting(r -> r.getBodyAsString()).containsOnly(requests.getFirst().getBodyAsString());
 		assertThat(outboxRetryCount(sub.path())).isEqualTo(2);
 	}
 
@@ -168,6 +169,35 @@ class WebhookDispatchTest extends IntegrationTestBase {
 			assertThat(dead.get("payload").get("eventType").asString()).isEqualTo("transaction.completed");
 			assertThat(dead.has("secretKey")).isFalse();
 		}
+	}
+
+	@Test
+	void redirectIsNotDeliveredAndKeepsTheDeadLetterRow() {
+		Subscription sub = subscribe("/hooks/redir-" + UUID.randomUUID());
+		WIREMOCK.stubFor(post(urlEqualTo(sub.path()))
+				.willReturn(aResponse().withStatus(301).withHeader("Location", "http://127.0.0.1/nope")));
+
+		AccountView account = openAccount("USD");
+		deposit(account.accountNumber(), money("1.0000"));
+
+		await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertThat(outboxStatus(sub.path())).isEqualTo("FAILED"));
+		await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(3))
+				.untilAsserted(() -> assertThat(WIREMOCK.findAll(postRequestedFor(urlEqualTo(sub.path())))).hasSize(1));
+		assertThat(jdbc.sql("select last_error from webhook_outbox where target_url = ?")
+				.param(WIREMOCK.baseUrl() + sub.path()).query(String.class).single()).contains("301");
+		assertThat(jdbc.sql("select payload::text from webhook_outbox where target_url = ?")
+				.param(WIREMOCK.baseUrl() + sub.path()).query(String.class).single()).contains("transaction.completed");
+	}
+
+	@Test
+	void rejectsLoopbackSubscriptionTargets() {
+		for (String url : List.of("http://127.0.0.1/", "http://localhost/")) {
+			ResponseEntity<String> response = api.post().uri("/api/v1/webhooks").contentType(MediaType.APPLICATION_JSON)
+					.body(Map.of("targetUrl", url)).retrieve().toEntity(String.class);
+			assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+		}
+		assertThat(jdbc.sql("select count(*) from webhook_subscriptions where target_url in (?, ?)")
+				.params("http://127.0.0.1/", "http://localhost/").query(Long.class).single()).isZero();
 	}
 
 	@Test

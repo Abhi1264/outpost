@@ -1,6 +1,8 @@
 package com.ledger.webhook;
 
 import com.ledger.ledger.TransactionCommittedEvent;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Limit;
@@ -11,6 +13,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -22,15 +25,20 @@ import java.util.UUID;
 class OutboxRelay {
 
 	private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+	private static final List<WebhookOutbox.Status> IN_FLIGHT =
+			List.of(WebhookOutbox.Status.PENDING, WebhookOutbox.Status.PROCESSING);
 
 	private final WebhookOutboxRepository outbox;
 	private final KafkaTemplate<String, String> kafka;
 	private final WebhookProperties properties;
 
-	OutboxRelay(WebhookOutboxRepository outbox, KafkaTemplate<String, String> kafka, WebhookProperties properties) {
+	OutboxRelay(WebhookOutboxRepository outbox, KafkaTemplate<String, String> kafka, WebhookProperties properties,
+			MeterRegistry meters) {
 		this.outbox = outbox;
 		this.kafka = kafka;
 		this.properties = properties;
+		Gauge.builder("outpost.webhook.outbox.inflight", outbox, o -> (double) o.countByStatusIn(IN_FLIGHT))
+				.register(meters);
 	}
 
 	@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)

@@ -53,6 +53,12 @@ class WebhookSubscriptionController {
 	@PostMapping
 	@ResponseStatus(HttpStatus.CREATED)
 	SubscriptionView create(@Valid @RequestBody CreateSubscriptionRequest request, Authentication auth) {
+		try {
+			WebhookDispatcher.rejectBlockedHost(request.targetUrl());
+		}
+		catch (IllegalArgumentException ex) {
+			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ex.getMessage());
+		}
 		byte[] secret = new byte[32];
 		RANDOM.nextBytes(secret);
 		WebhookSubscription saved = subscriptions.save(new WebhookSubscription(auth.getName(), request.targetUrl(),

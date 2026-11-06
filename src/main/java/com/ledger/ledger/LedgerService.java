@@ -6,6 +6,8 @@ import com.ledger.ledger.LedgerApi.EntryView;
 import com.ledger.ledger.LedgerApi.TransactionType;
 import com.ledger.ledger.LedgerApi.TransactionView;
 import com.ledger.webhook.OutboxWriter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -37,13 +39,15 @@ public class LedgerService {
 	private final LedgerEntryRepository entries;
 	private final OutboxWriter outbox;
 	private final ApplicationEventPublisher events;
+	private final Timer postings;
 
 	LedgerService(AccountRepository accounts, LedgerEntryRepository entries, OutboxWriter outbox,
-			ApplicationEventPublisher events) {
+			ApplicationEventPublisher events, MeterRegistry meters) {
 		this.accounts = accounts;
 		this.entries = entries;
 		this.outbox = outbox;
 		this.events = events;
+		this.postings = Timer.builder("outpost.ledger.posting").register(meters);
 	}
 
 	@Transactional
@@ -66,32 +70,38 @@ public class LedgerService {
 
 	@Transactional
 	public TransactionView deposit(String accountNumber, BigDecimal amount) {
-		Account customer = lockCustomer(accountNumber);
-		Account clearing = lockClearing(customer);
-		return post(TransactionType.DEPOSIT, clearing, customer, Money.of(amount));
+		return postings.record(() -> {
+			Account customer = lockCustomer(accountNumber);
+			Account clearing = lockClearing(customer);
+			return post(TransactionType.DEPOSIT, clearing, customer, Money.of(amount));
+		});
 	}
 
 	@Transactional
 	public TransactionView withdraw(String accountNumber, BigDecimal amount) {
-		Account customer = lockCustomer(accountNumber);
-		Account clearing = lockClearing(customer);
-		return post(TransactionType.WITHDRAWAL, customer, clearing, Money.of(amount));
+		return postings.record(() -> {
+			Account customer = lockCustomer(accountNumber);
+			Account clearing = lockClearing(customer);
+			return post(TransactionType.WITHDRAWAL, customer, clearing, Money.of(amount));
+		});
 	}
 
 	@Transactional
 	public TransactionView transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
-		if (fromAccountNumber.equals(toAccountNumber)) {
-			throw LedgerException.invalid("Source and destination accounts must differ");
-		}
-		boolean fromFirst = fromAccountNumber.compareTo(toAccountNumber) < 0;
-		Account first = lockCustomer(fromFirst ? fromAccountNumber : toAccountNumber);
-		Account second = lockCustomer(fromFirst ? toAccountNumber : fromAccountNumber);
-		Account source = fromFirst ? first : second;
-		Account destination = fromFirst ? second : first;
-		if (!source.getCurrency().equals(destination.getCurrency())) {
-			throw LedgerException.currencyMismatch(source.getCurrency(), destination.getCurrency());
-		}
-		return post(TransactionType.TRANSFER, source, destination, Money.of(amount));
+		return postings.record(() -> {
+			if (fromAccountNumber.equals(toAccountNumber)) {
+				throw LedgerException.invalid("Source and destination accounts must differ");
+			}
+			boolean fromFirst = fromAccountNumber.compareTo(toAccountNumber) < 0;
+			Account first = lockCustomer(fromFirst ? fromAccountNumber : toAccountNumber);
+			Account second = lockCustomer(fromFirst ? toAccountNumber : fromAccountNumber);
+			Account source = fromFirst ? first : second;
+			Account destination = fromFirst ? second : first;
+			if (!source.getCurrency().equals(destination.getCurrency())) {
+				throw LedgerException.currencyMismatch(source.getCurrency(), destination.getCurrency());
+			}
+			return post(TransactionType.TRANSFER, source, destination, Money.of(amount));
+		});
 	}
 
 	private TransactionView post(TransactionType type, Account debited, Account credited, BigDecimal amount) {

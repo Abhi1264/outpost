@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -53,6 +54,8 @@ public interface WebhookOutboxRepository extends JpaRepository<WebhookOutbox, UU
 			order by o.nextRetryAt
 			""")
 	List<UUID> findDueIds(Instant dueBefore, Limit limit);
+
+	long countByStatusIn(Collection<WebhookOutbox.Status> statuses);
 
 	@Transactional
 	@Modifying(clearAutomatically = true)

@@ -10,7 +10,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
-import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -29,39 +28,40 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 		"outpost.webhook.jitter=0",
 		"outpost.webhook.poll-interval=PT0.2S",
 		"outpost.webhook.stale-processing-after=30s" })
-abstract class IntegrationTestBase {
+public abstract class IntegrationTestBase {
 
 	static final String USER = "test-client";
 	static final String PASSWORD = "test-secret";
 	static final Faker FAKER = new Faker();
 
-	static final WireMockServer WIREMOCK = new WireMockServer(options().dynamicPort());
+	protected static final WireMockServer WIREMOCK = new WireMockServer(options().dynamicPort());
 	static {
 		WIREMOCK.start();
+		System.setProperty("outpost.test.loopback-port", Integer.toString(WIREMOCK.port()));
 	}
 
 	@LocalServerPort
 	int port;
 
 	@Autowired
-	JdbcClient jdbc;
+	protected JdbcClient jdbc;
 
 	@Autowired
 	RestClient.Builder restClientBuilder;
 
-	RestClient api;
+	protected RestClient api;
 
 	@BeforeEach
 	void buildClient() {
 		api = restClientBuilder.clone()
 				.baseUrl("http://localhost:" + port)
 				.defaultHeaders(h -> h.setBasicAuth(USER, PASSWORD))
-				.defaultStatusHandler(HttpStatusCode::isError, (request, response) -> {
+				.defaultStatusHandler(status -> status.isError(), (request, response) -> {
 				})
 				.build();
 	}
 
-	AccountView openAccount(String currency) {
+	protected AccountView openAccount(String currency) {
 		return api.post().uri("/api/v1/accounts").contentType(MediaType.APPLICATION_JSON)
 				.body(Map.of("currency", currency)).retrieve().body(AccountView.class);
 	}
@@ -70,7 +70,7 @@ abstract class IntegrationTestBase {
 		return api.get().uri("/api/v1/accounts/{n}", accountNumber).retrieve().body(AccountView.class);
 	}
 
-	ResponseEntity<TransactionView> deposit(String accountNumber, BigDecimal amount) {
+	protected ResponseEntity<TransactionView> deposit(String accountNumber, BigDecimal amount) {
 		return amountPost("/api/v1/accounts/{n}/deposits", accountNumber, amount, null);
 	}
 
@@ -99,7 +99,7 @@ abstract class IntegrationTestBase {
 				.retrieve().toEntity(TransactionView.class);
 	}
 
-	BigDecimal money(String value) {
+	protected BigDecimal money(String value) {
 		return new BigDecimal(value).setScale(4);
 	}
 

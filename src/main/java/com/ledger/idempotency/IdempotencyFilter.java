@@ -10,7 +10,6 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
@@ -18,6 +17,9 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.UnexpectedRollbackException;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.ContentCachingResponseWrapper;
@@ -25,30 +27,27 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.Optional;
 
 /**
  * Idempotency for authenticated POSTs carrying an Idempotency-Key header, scoped per principal.
- * A 2xx response is stored and replayed for the same key; the same key with a different body is a 422;
- * a concurrent request for a key still in flight is a 409. Failures are not stored, so the key can be retried.
+ * The key row is inserted in the same database transaction as the ledger write. A 2xx is stored and
+ * replayed; the same key with a different body is a 422. Anything else rolls the key back.
  */
 @Component
 public class IdempotencyFilter extends OncePerRequestFilter {
 
 	public static final String HEADER = "Idempotency-Key";
 	private static final int MAX_KEY_LENGTH = 128;
-	// a crash after the ledger commits can double-post inside that window.
 	private static final int IN_FLIGHT = 0;
-	private static final Duration LOCK_TTL = Duration.ofSeconds(30);
 	private static final Logger log = LoggerFactory.getLogger(IdempotencyFilter.class);
 
 	private record Stored(String requestHash, int statusCode, String responsePayload) {
@@ -56,12 +55,15 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
 	private final JdbcClient jdbc;
 	private final JsonMapper json;
+	private final TransactionTemplate transactions;
 	private final Duration ttl;
 
-	IdempotencyFilter(JdbcClient jdbc, JsonMapper json, @Value("${outpost.idempotency.ttl}") Duration ttl) {
+	IdempotencyFilter(JdbcClient jdbc, JsonMapper json, PlatformTransactionManager tx,
+			@Value("${outpost.idempotency.ttl}") Duration ttl) {
 		this.jdbc = jdbc;
 		this.json = json;
 		this.ttl = ttl;
+		this.transactions = new TransactionTemplate(tx);
 	}
 
 	@Override
@@ -81,76 +83,90 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 		String key = request.getUserPrincipal().getName() + ":" + header;
 		byte[] body = request.getInputStream().readAllBytes();
 		String requestHash = sha256(request.getMethod(), request.getRequestURI(), body);
-
-		OffsetDateTime heldAt = claim(key, requestHash, response);
-		if (heldAt == null) {
-			return;
-		}
 		ContentCachingResponseWrapper wrapped = new ContentCachingResponseWrapper(response);
-		boolean stored = false;
+		ServletException[] servletFailure = new ServletException[1];
+		IOException[] ioFailure = new IOException[1];
 		try {
-			chain.doFilter(new CachedBodyRequest(request, body), wrapped);
-			if (HttpStatusCode.valueOf(wrapped.getStatus()).is2xxSuccessful()) {
-				stored = complete(key, heldAt, wrapped.getStatus(), wrapped.getContentAsByteArray());
-			}
+			transactions.executeWithoutResult(status -> {
+				if (!insert(key, requestHash)) {
+					conflict(key, requestHash, wrapped);
+					return;
+				}
+				try {
+					chain.doFilter(new CachedBodyRequest(request, body), wrapped);
+				}
+				catch (IOException ex) {
+					status.setRollbackOnly();
+					ioFailure[0] = ex;
+					return;
+				}
+				catch (ServletException ex) {
+					status.setRollbackOnly();
+					servletFailure[0] = ex;
+					return;
+				}
+				// ControllerAdvice turns LedgerException into a 4xx and marks this transaction rollback-only.
+				if (status.isRollbackOnly() || !is2xx(wrapped)) {
+					status.setRollbackOnly();
+					return;
+				}
+				store(key, wrapped.getStatus(), wrapped.getContentAsByteArray());
+			});
+			wrapped.copyBodyToResponse();
 		}
-		finally {
-			if (!stored) {
-				release(key, heldAt);
+		catch (UnexpectedRollbackException ex) {
+			if (servletFailure[0] != null) {
+				throw servletFailure[0];
+			}
+			if (ioFailure[0] != null) {
+				throw ioFailure[0];
+			}
+			if (is2xx(wrapped)) {
+				reset(response);
+				throw ex;
 			}
 			wrapped.copyBodyToResponse();
 		}
+		catch (RuntimeException ex) {
+			reset(response);
+			throw ex;
+		}
 	}
 
-	/** @return the created_at this request holds, or null when the response is already written. */
-	private OffsetDateTime claim(String key, String requestHash, HttpServletResponse response) throws IOException {
-		OffsetDateTime heldAt = insertInFlight(key, requestHash);
-		if (heldAt != null) {
-			return heldAt;
-		}
-		Optional<Stored> stored = find(key);
-		if (stored.isEmpty()) {
-			writeProblem(response, HttpStatus.CONFLICT, "A request with this " + HEADER + " is already in progress");
-			return null;
-		}
-		Stored row = stored.get();
-		if (row.statusCode() != IN_FLIGHT) {
+	private boolean insert(String key, String requestHash) {
+		return jdbc.sql("""
+				insert into idempotency_keys (key, request_hash, status_code)
+				values (?, ?, 0) on conflict (key) do nothing
+				""").params(key, requestHash).update() == 1;
+	}
+
+	private void conflict(String key, String requestHash, HttpServletResponse response) {
+		try {
+			Stored row = find(key).orElse(null);
+			if (row == null || row.statusCode() == IN_FLIGHT) {
+				writeProblem(response, HttpStatus.CONFLICT, "A request with this " + HEADER + " is already in progress");
+				return;
+			}
 			if (!row.requestHash().equals(requestHash)) {
 				writeProblem(response, HttpStatus.UNPROCESSABLE_CONTENT,
 						HEADER + " was already used with a different request");
-				return null;
+				return;
 			}
 			replay(response, row);
-			return null;
 		}
-		OffsetDateTime now = now();
-		int claimed = jdbc.sql("""
-				update idempotency_keys set request_hash = ?, created_at = ?
-				where key = ? and status_code = 0 and created_at < ?
-				""").params(requestHash, now, key, now.minus(LOCK_TTL)).update();
-		if (claimed == 1) {
-			return now;
+		catch (IOException ex) {
+			throw new UncheckedIOException(ex);
 		}
-		writeProblem(response, HttpStatus.CONFLICT, "A request with this " + HEADER + " is already in progress");
-		return null;
 	}
 
-	private OffsetDateTime insertInFlight(String key, String requestHash) {
-		OffsetDateTime now = now();
-		int inserted = jdbc.sql("""
-				insert into idempotency_keys (key, request_hash, status_code, response_payload, created_at)
-				values (?, ?, 0, null, ?) on conflict (key) do nothing
-				""").params(key, requestHash, now).update();
-		return inserted == 1 ? now : null;
-	}
-
-	private void release(String key, OffsetDateTime heldAt) {
-		jdbc.sql("delete from idempotency_keys where key = ? and status_code = 0 and created_at = ?")
-				.params(key, heldAt).update();
-	}
-
-	private static OffsetDateTime now() {
-		return Instant.now().truncatedTo(ChronoUnit.MICROS).atOffset(ZoneOffset.UTC);
+	private void store(String key, int status, byte[] responseBody) {
+		String payload = responseBody.length == 0 ? null : new String(responseBody, StandardCharsets.UTF_8);
+		int updated = jdbc.sql("""
+				update idempotency_keys set status_code = ?, response_payload = ?::jsonb where key = ?
+				""").params(status, payload, key).update();
+		if (updated != 1) {
+			throw new IllegalStateException("idempotency key was not stored");
+		}
 	}
 
 	private Optional<Stored> find(String key) {
@@ -159,21 +175,6 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 				.query((rs, i) -> new Stored(rs.getString("request_hash"), rs.getInt("status_code"),
 						rs.getString("response_payload")))
 				.optional();
-	}
-
-	private boolean complete(String key, OffsetDateTime heldAt, int status, byte[] responseBody) {
-		String payload = responseBody.length == 0 ? null : new String(responseBody, StandardCharsets.UTF_8);
-		try {
-			return jdbc.sql("""
-					update idempotency_keys set status_code = ?, response_payload = ?::jsonb
-					where key = ? and status_code = 0 and created_at = ?
-					""").params(status, payload, key, heldAt).update() == 1;
-		}
-		catch (DataAccessException ex) {
-			// the ledger transaction is already committed; failing here would turn a success into a 500
-			log.error("Failed to persist idempotency key {}", key, ex);
-			return false;
-		}
 	}
 
 	private void replay(HttpServletResponse response, Stored stored) throws IOException {
@@ -189,6 +190,21 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 		response.setStatus(status.value());
 		response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
 		json.writeValue(response.getOutputStream(), ProblemDetail.forStatusAndDetail(status, detail));
+	}
+
+	private static boolean is2xx(HttpServletResponse response) {
+		return HttpStatusCode.valueOf(response.getStatus()).is2xxSuccessful();
+	}
+
+	private static void reset(HttpServletResponse response) {
+		try {
+			if (!response.isCommitted()) {
+				response.reset();
+			}
+		}
+		catch (IllegalStateException ignored) {
+			// too late to clear a buffered status; the error still propagates
+		}
 	}
 
 	@Scheduled(cron = "0 0 * * * *")

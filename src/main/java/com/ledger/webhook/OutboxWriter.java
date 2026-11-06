@@ -36,7 +36,7 @@ public class OutboxWriter {
 		List<WebhookOutbox> rows = active.stream()
 				.map(s -> new WebhookOutbox(eventType, payload, s.getTargetUrl(), s.getSecretKey()))
 				.toList();
-		return outbox.saveAll(rows).stream().map(WebhookOutbox::getId).toList();
+		return outbox.saveAll(rows).stream().map(row -> row.getId()).toList();
 	}
 
 }
